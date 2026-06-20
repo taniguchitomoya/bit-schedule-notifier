@@ -248,8 +248,8 @@ rm -f notifier.zip
 # 7. Configure EventBridge Triggers
 echo "=== Setting up EventBridge Triggers ==="
 
-# Scraper Rule: Daily at 4:00 AM JST (19:00 UTC)
-SCRAPER_CRON="cron(0 19 ? * * *)"
+# Scraper Rule: Weekly at 8:40 AM JST on Monday (23:40 UTC on Sunday)
+SCRAPER_CRON="cron(40 23 ? * SUN *)"
 echo "Creating Scraper Trigger: $SCRAPER_CRON..."
 SCRAPER_RULE_ARN=$(aws events put-rule \
     --name "$SCRAPER_RULE_NAME" \
@@ -298,7 +298,7 @@ echo "=== Deployment Finished Successfully ==="
 echo "S3 Bucket: $S3_BUCKET_NAME"
 echo "Scraper Lambda: $SCRAPER_FUNCTION_NAME"
 echo "Notifier Lambda: $NOTIFIER_FUNCTION_NAME"
-echo "Scraper Trigger: Everyday at 4:00 AM JST"
+echo "Scraper Trigger: Weekly at 8:40 AM JST on Monday"
 echo "Notifier Trigger: Weekdays at 9:10 AM JST"
 echo ""
 echo "To trigger the scraper manually and fetch the latest schedule (Wait with 5 min timeout):"

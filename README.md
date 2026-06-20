@@ -12,7 +12,7 @@
 
 ```mermaid
 graph TD
-    A[EventBridge: 毎日4:00 JST] -->|起動| B[Scraper Lambda: bitschedule-scraper]
+    A[EventBridge: 毎週月曜8:40 JST] -->|起動| B[Scraper Lambda: bitschedule-scraper]
     B -->|スクレイピング| C(BIT サイト)
     B -->|CSVアップロード| D[Amazon S3: schedule_dates.csv]
     
@@ -21,7 +21,7 @@ graph TD
     F -->|本日分があれば投稿| G[Discord Webhook]
 ```
 
-1.  **スクレイピングフェーズ（毎日 4:00 JST / 19:00 UTC 実行）**
+1.  **スクレイピングフェーズ（毎週月曜 8:40 JST / 日曜 23:40 UTC 実行）**
     *   EventBridge によって `bitschedule-scraper` が起動。
     *   BIT から最新スケジュールをスクレイピングしてパースし、CSV データとして Amazon S3 バケットにアップロードして保存します。
 2.  **通知フェーズ（平日 9:10 JST / 0:10 UTC 実行）**
@@ -70,7 +70,7 @@ graph TD
 2.  Lambda 用 IAM 実行ロールのセットアップ（S3 への読み書き権限付きのポリシーをインラインアタッチ）
 3.  `requirements.txt` の依存パッケージを同梱した `bitschedule-scraper` 関数のデプロイ（タイムアウト: 5分）
 4.  `bitschedule-notifier` 関数のデプロイ（タイムアウト: 30秒）
-5.  EventBridge トリガーの設定（毎日 4:00 JST の Scraper 起動 / 平日 9:10 JST の Notifier 起動）
+5.  EventBridge トリガーの設定（毎週月曜 8:40 JST の Scraper 起動 / 平日 9:10 JST の Notifier 起動）
 
 ---
 
