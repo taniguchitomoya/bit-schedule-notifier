@@ -4,9 +4,7 @@
 > **AI-Generated Repository**  
 > 本リポジトリのソースコード、デプロイスクリプト、および関連ドキュメントは、AIアシスタントによって自動生成・構築されたものです。
 
-このリポジトリは、不動産競売物件情報サイト (BIT) から裁判所ごとの閲覧開始スケジュールを抽出し、その日の閲覧開始情報を Discord に自動通知する AWS 上のサーバーレスシステムです。
-
-推奨構成である「S3データ連携・分離方式（パターンB）」を採用しており、スクレイピング（ダウンロード）処理と Discord 通知処理をそれぞれ独立した Lambda 関数で実行します。
+スクレイピング（ダウンロード）処理と Discord 通知処理をそれぞれ独立した Lambda 関数で実行し、S3を介してデータを連携します。
 
 ---
 
@@ -39,17 +37,13 @@ graph TD
 ├── .gitignore               # Git管理対象外設定
 ├── README.md                # 本ドキュメント
 ├── requirements.txt         # 依存ライブラリ (Scraper Lambdaのビルド時に自動同梱)
-├── lambda_scraper.py        # 【新規】AWS Lambda 用スクレイピングスクリプト
-├── lambda_notifier.py       # 【新規】AWS Lambda 用 Discord 通知スクリプト
+├── lambda_scraper.py        # AWS Lambda 用スクレイピングスクリプト
+├── lambda_notifier.py       # AWS Lambda 用 Discord 通知スクリプト
 ├── deploy.sh                # AWSデプロイスクリプト (S3作成/IAM/2Lambda/EventBridgeの一括設定)
-├── extract_schedule.py      # ローカル実行用スケジュール抽出スクリプト (参考用)
-├── lambda_function.py       # 旧AWS Lambda 用通知スクリプト (参考用)
 └── .github/
     └── workflows/
         └── lint.yml         # GitHub Actions 用 CI ワークフロー
 ```
-
-*※ `schedule_dates.csv` および `download/`（キャッシュフォルダ）は、AWS S3 および Lambda の `/tmp` 領域を利用するため、Gitでの管理およびデプロイ時の同梱は不要になりました。*
 
 ---
 
@@ -106,4 +100,4 @@ aws lambda invoke --function-name bitschedule-notifier response_notifier.json &&
 1.  **スクレイピングエラーの監視**:
     `bitschedule-scraper` でパースエラーやネットワークエラーが発生した場合、指定された `DISCORD_WEBHOOK_URL` 宛てにエラーログが直接通知されるエラーハンドリングロジックが組み込まれています。
 2.  **EventBridge トリガーの永続性**:
-    以前のバージョンとは異なり、EventBridge ルールの cron スケジュールに年制限を設けていないため（`*` 指定）、永続的に自動起動し続けます。手動で停止したい場合は、AWS コンソールから EventBridge ルールを「無効化」してください。
+    EventBridge ルールの cron スケジュールに年制限を設けていないため（`*` 指定）、永続的に自動起動し続けます。手動で停止したい場合は、AWS コンソールから EventBridge ルールを「無効化」してください。
