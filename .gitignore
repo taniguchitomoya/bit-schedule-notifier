@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Project-specific caches and downloaded raw htmls
+download/
+
+# Deployment artifacts and temp files
+lambda.zip
+trust-policy.json
+response.json
+
+# OS files
+.DS_Store
+Thumbs.db
