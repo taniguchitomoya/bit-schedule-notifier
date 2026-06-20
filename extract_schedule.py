@@ -13,6 +13,17 @@ OUTPUT_CSV = "schedule_dates.csv"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
 }
+CACHE_TTL_SECONDS = 12 * 60 * 60  # Cache duration (12 hours)
+
+def is_cache_valid(filepath, ttl_seconds):
+    """
+    Checks if a file exists and its modification time is within the TTL.
+    """
+    if not os.path.exists(filepath):
+        return False
+    file_mtime = os.path.getmtime(filepath)
+    return (time.time() - file_mtime) < ttl_seconds
+
 
 def parse_wareki_date(date_str):
     """
@@ -36,7 +47,7 @@ def main():
     index_path = os.path.join(DOWNLOAD_DIR, "index.html")
     
     # 2. Download main index page
-    if not os.path.exists(index_path):
+    if not is_cache_valid(index_path, CACHE_TTL_SECONDS):
         print(f"Downloading main index from {BASE_URL}...")
         res = requests.get(BASE_URL, headers=HEADERS)
         res.raise_for_status()
@@ -44,7 +55,7 @@ def main():
         with open(index_path, "w", encoding="utf-8") as f:
             f.write(res.text)
     else:
-        print(f"Index page already exists at {index_path}. Using cached version.")
+        print(f"Using cached index page at {index_path}.")
         
     with open(index_path, "r", encoding="utf-8") as f:
         soup = BeautifulSoup(f.read(), "html.parser")
@@ -77,8 +88,8 @@ def main():
         
         file_path = os.path.join(DOWNLOAD_DIR, f"court_{court_id}.html")
         
-        # Download if not cached
-        if not os.path.exists(file_path):
+        # Download if cache is invalid or missing
+        if not is_cache_valid(file_path, CACHE_TTL_SECONDS):
             print(f"[{i}/{len(courts)}] Downloading schedule for {court_name} (ID: {court_id})...")
             try:
                 res = requests.get(court_url, headers=HEADERS)

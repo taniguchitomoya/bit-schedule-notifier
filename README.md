@@ -68,3 +68,14 @@ python extract_schedule.py
 aws lambda invoke --function-name bitschedule-notifier --payload '{}' response.json && cat response.json && rm response.json
 ```
 正常に実行されると、指定した Discord チャンネルに本日の競売閲覧開始日一覧が投稿されます。
+
+## 運用上の注意・制限事項
+
+1. **EventBridge トリガーの有効期限について（将来の自動実行停止）**:
+   `deploy.sh` で自動作成される EventBridge ルールの cron スケジュールは、デプロイ時点の2年間（当年度〜翌年度）に制限されています（例: 2026年実行時は `2026-2027`）。
+   期限が切れると Lambda の自動実行が停止するため、永続化する場合は AWS コンソール等から EventBridge スケジュールの年フィールドを `*`（例: `cron(10 0 ? * MON-FRI *)`）に変更するか、定期的にデプロイし直してください。
+
+2. **将来の元号変更（改元）時の対応について**:
+   競売データのスケジュールパース（`extract_schedule.py`）および当日日付の和暦判定（`lambda_function.py`）は、令和（`R` / `2018 + Y`）に固定されています。
+   将来的に新たな元号に改元された際は、それぞれの元号変換ロジックを手動で修正・アップデートする必要があります。
+
