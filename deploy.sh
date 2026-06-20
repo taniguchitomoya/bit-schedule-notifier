@@ -2,52 +2,91 @@
 set -e
 
 # Configuration
-FUNCTION_NAME="bitschedule-notifier"
-RULE_NAME="bitschedule-daily-trigger"
+SCRAPER_FUNCTION_NAME="bitschedule-scraper"
+NOTIFIER_FUNCTION_NAME="bitschedule-notifier"
 ROLE_NAME="bitschedule-lambda-role"
-ZIP_FILE="lambda.zip"
-CSV_FILE="schedule_dates.csv"
-LAMBDA_FILE="lambda_function.py"
+SCRAPER_RULE_NAME="bitschedule-scraper-trigger"
+NOTIFIER_RULE_NAME="bitschedule-notifier-trigger"
 
-# 1. Check if Lambda function exists
-FUNCTION_EXISTS=$(aws lambda get-function --function-name "$FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
+# Input arguments
+DISCORD_WEBHOOK_URL="$1"
+S3_BUCKET_NAME="$2"
 
-# 2. Resolve Discord Webhook URL if provided
-if [ -n "$1" ]; then
-    DISCORD_WEBHOOK_URL="$1"
+# 1. Resolve arguments / env variables
+if [ -z "$DISCORD_WEBHOOK_URL" ] && [ -n "$DISCORD_WEBHOOK_URL_ENV" ]; then
+    DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL_ENV"
 fi
 
-if [ -z "$FUNCTION_EXISTS" ] && [ -z "$DISCORD_WEBHOOK_URL" ]; then
-    echo "Error: DISCORD_WEBHOOK_URL is required to create a new Lambda function."
-    echo "Usage: ./deploy.sh <YOUR_DISCORD_WEBHOOK_URL>"
-    echo "Or set the environment variable: export DISCORD_WEBHOOK_URL='<YOUR_URL>'"
+# Ensure Discord URL is set (for notifier function creation/configuration)
+if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+    # We only error out if functions don't exist yet
+    SCRAPER_EXISTS=$(aws lambda get-function --function-name "$SCRAPER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
+    NOTIFIER_EXISTS=$(aws lambda get-function --function-name "$NOTIFIER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
+    if [ -z "$SCRAPER_EXISTS" ] || [ -z "$NOTIFIER_EXISTS" ]; then
+        echo "Error: DISCORD_WEBHOOK_URL is required for initial deployment."
+        echo "Usage: ./deploy.sh <YOUR_DISCORD_WEBHOOK_URL> [OPTIONAL_S3_BUCKET_NAME]"
+        exit 1
+    fi
+fi
+
+# Get AWS Account ID to generate bucket name if not provided
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text 2>/dev/null || true)
+if [ -z "$AWS_ACCOUNT_ID" ]; then
+    echo "Error: Failed to retrieve AWS Account ID. Please ensure your AWS CLI is configured correctly."
     exit 1
 fi
 
-echo "=== Starting deployment for $FUNCTION_NAME ==="
-
-# 2. Check dependencies
-if [ ! -f "$LAMBDA_FILE" ]; then
-    echo "Error: $LAMBDA_FILE not found in the current directory."
-    exit 1
-fi
-if [ ! -f "$CSV_FILE" ]; then
-    echo "Error: $CSV_FILE not found in the current directory."
-    exit 1
+if [ -z "$S3_BUCKET_NAME" ]; then
+    S3_BUCKET_NAME="bitschedule-data-${AWS_ACCOUNT_ID}"
+    echo "No S3 Bucket specified. Automatically using bucket name: $S3_BUCKET_NAME"
 fi
 
-# 3. Setup IAM Role
+REGION=$(aws configure get region || echo "ap-northeast-1")
+echo "=== Deploying to region: $REGION ==="
+
+# 2. Clean up legacy configurations from previous single-lambda version if they exist
+echo "Checking for legacy EventBridge configurations..."
+OLD_RULE_EXISTS=$(aws events describe-rule --name "bitschedule-daily-trigger" --query "Name" --output text 2>/dev/null || true)
+if [ -n "$OLD_RULE_EXISTS" ] && [ "$OLD_RULE_EXISTS" != "None" ]; then
+    echo "Found legacy configuration: bitschedule-daily-trigger"
+    echo "Removing targets from legacy rule..."
+    aws events remove-targets --rule "bitschedule-daily-trigger" --ids "1" 2>/dev/null || true
+    
+    echo "Deleting legacy rule..."
+    aws events delete-rule --name "bitschedule-daily-trigger" 2>/dev/null || true
+    
+    echo "Removing legacy Lambda permission 'EventBridgeDailyTrigger'..."
+    aws lambda remove-permission \
+        --function-name "$NOTIFIER_FUNCTION_NAME" \
+        --statement-id "EventBridgeDailyTrigger" \
+        2>/dev/null || true
+    echo "Legacy configurations cleaned up successfully."
+fi
+
+# 3. Create S3 Bucket if it doesn't exist
+echo "Checking S3 bucket '$S3_BUCKET_NAME'..."
+if aws s3api head-bucket --bucket "$S3_BUCKET_NAME" 2>/dev/null; then
+    echo "S3 bucket already exists."
+else
+    echo "S3 bucket does not exist. Creating bucket: $S3_BUCKET_NAME..."
+    if [ "$REGION" = "us-east-1" ]; then
+        aws s3api create-bucket --bucket "$S3_BUCKET_NAME" --region "$REGION"
+    else
+        aws s3api create-bucket --bucket "$S3_BUCKET_NAME" --region "$REGION" \
+            --create-bucket-configuration LocationConstraint="$REGION"
+    fi
+    echo "S3 bucket created successfully."
+fi
+
+# 4. Setup IAM Role
 echo "Setting up IAM execution role..."
 ROLE_ARN=""
-
-# Check if role already exists
 EXISTING_ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query "Role.Arn" --output text 2>/dev/null || true)
 
 if [ -n "$EXISTING_ROLE_ARN" ]; then
     echo "Using existing IAM role: $ROLE_NAME"
     ROLE_ARN="$EXISTING_ROLE_ARN"
 else
-    # Try to create new role
     echo "Creating new IAM role: $ROLE_NAME..."
     cat <<EOF > trust-policy.json
 {
@@ -63,108 +102,207 @@ else
   ]
 }
 EOF
+    ROLE_ARN=$(aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file://trust-policy.json --query "Role.Arn" --output text)
+    rm -f trust-policy.json
+    
+    echo "Attaching AWSLambdaBasicExecutionRole policy..."
+    aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    
+    echo "Attaching S3 permissions to the new IAM role..."
+    cat <<EOF > s3-policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*"
+    }
+  ]
+}
+EOF
+    aws iam put-role-policy \
+        --role-name "$ROLE_NAME" \
+        --policy-name "bitschedule-s3-policy" \
+        --policy-document file://s3-policy.json
+    rm -f s3-policy.json
 
-    if ROLE_ARN=$(aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file://trust-policy.json --query "Role.Arn" --output text 2>/dev/null); then
-        echo "Role created successfully. Attaching BasicExecutionRole policy..."
-        aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-        rm trust-policy.json
-        echo "Waiting 10 seconds for IAM role propagation..."
-        sleep 10
-    else
-        echo "WARNING: Failed to create IAM role '$ROLE_NAME' (likely due to insufficient permissions)."
-        rm -f trust-policy.json
-        
-        # Check if AWS_ROLE_ARN is provided via environment variable
-        if [ -n "$AWS_ROLE_ARN" ]; then
-            echo "Using provided AWS_ROLE_ARN: $AWS_ROLE_ARN"
-            ROLE_ARN="$AWS_ROLE_ARN"
-        else
-            echo "Error: Could not create a new IAM role."
-            echo "If you have an existing execution role, please specify it via the AWS_ROLE_ARN environment variable."
-            echo "Example: export AWS_ROLE_ARN='arn:aws:iam::123456789012:role/your-lambda-role'"
-            exit 1
-        fi
-    fi
+    echo "Waiting 10 seconds for IAM role propagation..."
+    sleep 10
 fi
 
-# 4. Create deployment package
-echo "Packaging lambda code and CSV..."
-rm -f "$ZIP_FILE"
-zip -q "$ZIP_FILE" "$LAMBDA_FILE" "$CSV_FILE"
-echo "Package created: $ZIP_FILE"
+# 5. Build and Deploy Scraper Lambda
+echo "=== Building and Deploying Scraper Lambda ==="
+rm -rf build_scraper scraper.zip
+mkdir -p build_scraper
 
-# 5. Deploy / Update Lambda Function
-echo "Deploying Lambda function..."
+# Install scraper dependencies
+if [ -f "requirements.txt" ]; then
+    echo "Installing requirements for scraper..."
+    pip install -q -r requirements.txt -t build_scraper/
+fi
+cp lambda_scraper.py build_scraper/lambda_function.py
 
-if [ -z "$FUNCTION_EXISTS" ]; then
-    echo "Creating new Lambda function: $FUNCTION_NAME..."
+# Create zip
+cd build_scraper
+zip -q -r ../scraper.zip .
+cd ..
+rm -rf build_scraper
+echo "Scraper package created: scraper.zip"
+
+# Deploy function
+SCRAPER_EXISTS=$(aws lambda get-function --function-name "$SCRAPER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
+if [ -z "$SCRAPER_EXISTS" ]; then
+    echo "Creating Scraper Lambda function..."
     aws lambda create-function \
-        --function-name "$FUNCTION_NAME" \
+        --function-name "$SCRAPER_FUNCTION_NAME" \
         --runtime python3.11 \
         --role "$ROLE_ARN" \
         --handler lambda_function.lambda_handler \
-        --zip-file fileb://"$ZIP_FILE" \
-        --timeout 30 \
-        --environment "Variables={DISCORD_WEBHOOK_URL=$DISCORD_WEBHOOK_URL}"
-    echo "Lambda function created successfully."
+        --zip-file fileb://scraper.zip \
+        --timeout 300 \
+        --memory-size 256 \
+        --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
+    echo "Scraper Lambda created."
 else
-    echo "Lambda function already exists. Updating function code..."
+    echo "Scraper Lambda already exists. Updating code..."
     aws lambda update-function-code \
-        --function-name "$FUNCTION_NAME" \
-        --zip-file fileb://"$ZIP_FILE"
+        --function-name "$SCRAPER_FUNCTION_NAME" \
+        --zip-file fileb://scraper.zip
         
+    echo "Waiting for Scraper Lambda code update to complete..."
+    aws lambda wait function-updated --function-name "$SCRAPER_FUNCTION_NAME"
+    
+    echo "Updating Scraper configuration..."
     if [ -n "$DISCORD_WEBHOOK_URL" ]; then
-        echo "Waiting for function code update to complete..."
-        aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-        
-        echo "Updating environment variables and configuration..."
         aws lambda update-function-configuration \
-            --function-name "$FUNCTION_NAME" \
-            --environment "Variables={DISCORD_WEBHOOK_URL=$DISCORD_WEBHOOK_URL}" \
-            --timeout 30
-        echo "Lambda function configuration updated successfully."
+            --function-name "$SCRAPER_FUNCTION_NAME" \
+            --timeout 300 \
+            --memory-size 256 \
+            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
     else
-        echo "No new DISCORD_WEBHOOK_URL provided. Keeping existing Lambda configuration."
+        EXISTING_WEBHOOK=$(aws lambda get-function-configuration --function-name "$SCRAPER_FUNCTION_NAME" --query "Environment.Variables.DISCORD_WEBHOOK_URL" --output text 2>/dev/null || echo "")
+        aws lambda update-function-configuration \
+            --function-name "$SCRAPER_FUNCTION_NAME" \
+            --timeout 300 \
+            --memory-size 256 \
+            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${EXISTING_WEBHOOK}}"
     fi
+    echo "Scraper Lambda configuration updated."
 fi
+rm -f scraper.zip
 
-# 6. Configure EventBridge rule (Weekday trigger at 9:10 AM JST / 0:10 UTC until next year)
-CURRENT_YEAR=$(date +%Y)
-NEXT_YEAR=$((CURRENT_YEAR + 1))
-CRON_EXPR="cron(10 0 ? * MON-FRI ${CURRENT_YEAR}-${NEXT_YEAR})"
-echo "Setting up EventBridge Rule (Trigger: Weekdays at 9:10 JST / 0:10 UTC, Year: ${CURRENT_YEAR}-${NEXT_YEAR})..."
-echo "Cron expression: $CRON_EXPR"
+# 6. Build and Deploy Notifier Lambda
+echo "=== Building and Deploying Notifier Lambda ==="
+rm -rf build_notifier notifier.zip
+mkdir -p build_notifier
+cp lambda_notifier.py build_notifier/lambda_function.py
 
-RULE_ARN=$(aws events put-rule \
-    --name "$RULE_NAME" \
-    --schedule-expression "$CRON_EXPR" \
+cd build_notifier
+zip -q -r ../notifier.zip .
+cd ..
+rm -rf build_notifier
+echo "Notifier package created: notifier.zip"
+
+NOTIFIER_EXISTS=$(aws lambda get-function --function-name "$NOTIFIER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
+if [ -z "$NOTIFIER_EXISTS" ]; then
+    echo "Creating Notifier Lambda function..."
+    aws lambda create-function \
+        --function-name "$NOTIFIER_FUNCTION_NAME" \
+        --runtime python3.11 \
+        --role "$ROLE_ARN" \
+        --handler lambda_function.lambda_handler \
+        --zip-file fileb://notifier.zip \
+        --timeout 30 \
+        --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
+    echo "Notifier Lambda created."
+else
+    echo "Notifier Lambda already exists. Updating code..."
+    aws lambda update-function-code \
+        --function-name "$NOTIFIER_FUNCTION_NAME" \
+        --zip-file fileb://notifier.zip
+        
+    echo "Waiting for Notifier Lambda code update to complete..."
+    aws lambda wait function-updated --function-name "$NOTIFIER_FUNCTION_NAME"
+    
+    echo "Updating Notifier configuration..."
+    if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+        aws lambda update-function-configuration \
+            --function-name "$NOTIFIER_FUNCTION_NAME" \
+            --timeout 30 \
+            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
+    else
+        EXISTING_WEBHOOK=$(aws lambda get-function-configuration --function-name "$NOTIFIER_FUNCTION_NAME" --query "Environment.Variables.DISCORD_WEBHOOK_URL" --output text 2>/dev/null || echo "")
+        aws lambda update-function-configuration \
+            --function-name "$NOTIFIER_FUNCTION_NAME" \
+            --timeout 30 \
+            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${EXISTING_WEBHOOK}}"
+    fi
+    echo "Notifier Lambda configuration updated."
+fi
+rm -f notifier.zip
+
+# 7. Configure EventBridge Triggers
+echo "=== Setting up EventBridge Triggers ==="
+
+# Scraper Rule: Daily at 4:00 AM JST (19:00 UTC)
+SCRAPER_CRON="cron(0 19 ? * * *)"
+echo "Creating Scraper Trigger: $SCRAPER_CRON..."
+SCRAPER_RULE_ARN=$(aws events put-rule \
+    --name "$SCRAPER_RULE_NAME" \
+    --schedule-expression "$SCRAPER_CRON" \
     --state ENABLED \
     --query "RuleArn" \
     --output text)
 
-echo "Adding Lambda invocation permission for EventBridge..."
 aws lambda add-permission \
-    --function-name "$FUNCTION_NAME" \
-    --statement-id "EventBridgeDailyTrigger" \
+    --function-name "$SCRAPER_FUNCTION_NAME" \
+    --statement-id "EventBridgeScraperTrigger" \
     --action lambda:InvokeFunction \
     --principal events.amazonaws.com \
-    --source-arn "$RULE_ARN" \
+    --source-arn "$SCRAPER_RULE_ARN" \
     2>/dev/null || true
 
-# Link target
-LAMBDA_ARN=$(aws lambda get-function --function-name "$FUNCTION_NAME" --query "Configuration.FunctionArn" --output text)
-echo "Adding target to EventBridge rule..."
+SCRAPER_LAMBDA_ARN=$(aws lambda get-function --function-name "$SCRAPER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text)
 aws events put-targets \
-    --rule "$RULE_NAME" \
-    --targets "Id=1,Arn=$LAMBDA_ARN"
+    --rule "$SCRAPER_RULE_NAME" \
+    --targets "Id=1,Arn=$SCRAPER_LAMBDA_ARN"
 
-# Clean up local zip
-rm -f "$ZIP_FILE"
+# Notifier Rule: Weekdays at 9:10 AM JST (0:10 UTC)
+NOTIFIER_CRON="cron(10 0 ? * MON-FRI *)"
+echo "Creating Notifier Trigger: $NOTIFIER_CRON..."
+NOTIFIER_RULE_ARN=$(aws events put-rule \
+    --name "$NOTIFIER_RULE_NAME" \
+    --schedule-expression "$NOTIFIER_CRON" \
+    --state ENABLED \
+    --query "RuleArn" \
+    --output text)
+
+aws lambda add-permission \
+    --function-name "$NOTIFIER_FUNCTION_NAME" \
+    --statement-id "EventBridgeNotifierTrigger" \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "$NOTIFIER_RULE_ARN" \
+    2>/dev/null || true
+
+NOTIFIER_LAMBDA_ARN=$(aws lambda get-function --function-name "$NOTIFIER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text)
+aws events put-targets \
+    --rule "$NOTIFIER_RULE_NAME" \
+    --targets "Id=1,Arn=$NOTIFIER_LAMBDA_ARN"
 
 echo "=== Deployment Finished Successfully ==="
-echo "Lambda Function Name: $FUNCTION_NAME"
-echo "Role ARN: $ROLE_ARN"
-echo "EventBridge Rule Name: $RULE_NAME"
+echo "S3 Bucket: $S3_BUCKET_NAME"
+echo "Scraper Lambda: $SCRAPER_FUNCTION_NAME"
+echo "Notifier Lambda: $NOTIFIER_FUNCTION_NAME"
+echo "Scraper Trigger: Everyday at 4:00 AM JST"
+echo "Notifier Trigger: Weekdays at 9:10 AM JST"
 echo ""
-echo "To test the Lambda function immediately, run the following command:"
-echo "aws lambda invoke --function-name $FUNCTION_NAME --payload '{}' response.json && cat response.json && rm response.json"
+echo "To trigger the scraper manually and fetch the latest schedule (Wait with 5 min timeout):"
+echo "aws lambda invoke --function-name $SCRAPER_FUNCTION_NAME --cli-read-timeout 300 response_scraper.json && cat response_scraper.json && rm response_scraper.json"
+echo ""
+echo "To test notifier immediately after scraper finishes:"
+echo "aws lambda invoke --function-name $NOTIFIER_FUNCTION_NAME response_notifier.json && cat response_notifier.json && rm response_notifier.json"

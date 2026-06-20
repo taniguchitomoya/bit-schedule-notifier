@@ -14,8 +14,15 @@ download/
 
 # Deployment artifacts and temp files
 lambda.zip
+scraper.zip
+notifier.zip
 trust-policy.json
+s3-policy.json
 response.json
+response_*.json
+
+# Data files (now managed on S3)
+schedule_dates.csv
 
 # OS files
 .DS_Store
