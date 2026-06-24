@@ -33,7 +33,7 @@ def parse_wareki_date(date_str):
 def lambda_handler(event, context):
     s3_bucket = os.environ.get("S3_BUCKET")
     s3_key = os.environ.get("S3_KEY", "schedule_dates.csv")
-    discord_webhook_url = os.environ.get("DISCORD_WEBHOOK_URL") # Optional: error notification
+    dev_discord_webhook_url = os.environ.get("DEV_DISCORD_WEBHOOK_URL") # Optional: dev/error notification
     
     if not s3_bucket:
         print("Error: S3_BUCKET environment variable is not set!")
@@ -180,14 +180,14 @@ def lambda_handler(event, context):
         print(error_msg)
         
         # Send error notification to Discord if webhook URL is configured
-        if discord_webhook_url:
+        if dev_discord_webhook_url:
             try:
                 import json
                 import urllib.request
                 payload = {"content": f"⚠️ **【bitschedule-scraperエラー】**\n{error_msg}"}
                 req_data = json.dumps(payload).encode("utf-8")
                 req = urllib.request.Request(
-                    discord_webhook_url,
+                    dev_discord_webhook_url,
                     data=req_data,
                     headers={"Content-Type": "application/json", "User-Agent": "AWS Lambda"}
                 )

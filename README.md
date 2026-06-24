@@ -52,17 +52,24 @@ graph TD
 ### 3.1. 動作要件 (Prerequisites)
 *   **Python 3.11** (Lambda ランタイムおよびビルド時の pip 用)
 *   **AWS CLI** (`aws` コマンドが設定済みで、対象アカウントへのデプロイ権限があること)
-*   **Discord Webhook URL**
+*   **Discord Webhook URL** (必須: スケジュール通知用)
+*   **開発用 Discord Webhook URL** (任意: エラー通知用)
 
 ### 3.2. デプロイの実行
 `deploy.sh` に Discord Webhook URL を渡して実行します。S3 バケット名を指定しない場合、AWS アカウント ID を用いた一意のバケット（`bitschedule-data-<ACCOUNT_ID>`）が自動的に作成されます。
 
 ```bash
-# 自動生成されるS3バケット名を使用する場合
+# 基本デプロイ（自動生成されるS3バケット名を使用する場合）
 ./deploy.sh <YOUR_DISCORD_WEBHOOK_URL>
 
 # S3バケット名を明示的に指定する場合
 ./deploy.sh <YOUR_DISCORD_WEBHOOK_URL> <YOUR_UNIQUE_S3_BUCKET_NAME>
+
+# 開発用Webhook（エラー通知先）も設定する場合
+./deploy.sh <YOUR_DISCORD_WEBHOOK_URL> "" <YOUR_DEV_DISCORD_WEBHOOK_URL>
+
+# S3バケット名と開発用Webhookを両方明示的に指定する場合
+./deploy.sh <YOUR_DISCORD_WEBHOOK_URL> <YOUR_UNIQUE_S3_BUCKET_NAME> <YOUR_DEV_DISCORD_WEBHOOK_URL>
 ```
 
 実行される処理：
@@ -98,6 +105,7 @@ aws lambda invoke --function-name bitschedule-notifier response_notifier.json &&
 ## 5. 運用上の注意・制限事項
 
 1.  **スクレイピングエラーの監視**:
-    `bitschedule-scraper` でパースエラーやネットワークエラーが発生した場合、指定された `DISCORD_WEBHOOK_URL` 宛てにエラーログが直接通知されるエラーハンドリングロジックが組み込まれています。
+    `bitschedule-scraper` でパースエラーやネットワークエラーが発生した場合、指定された `DEV_DISCORD_WEBHOOK_URL` 宛てにエラーログが直接通知されるエラーハンドリングロジックが組み込まれています。
+    （※ `DEV_DISCORD_WEBHOOK_URL` が未指定の場合はエラー通知はスキップされます。既存デプロイの移行時には、過去に `DISCORD_WEBHOOK_URL` として設定されていた値が自動的に `DEV_DISCORD_WEBHOOK_URL` に引き継がれます。）
 2.  **EventBridge トリガーの永続性**:
     EventBridge ルールの cron スケジュールに年制限を設けていないため（`*` 指定）、永続的に自動起動し続けます。手動で停止したい場合は、AWS コンソールから EventBridge ルールを「無効化」してください。

@@ -11,10 +11,15 @@ NOTIFIER_RULE_NAME="bitschedule-notifier-trigger"
 # Input arguments
 DISCORD_WEBHOOK_URL="$1"
 S3_BUCKET_NAME="$2"
+DEV_DISCORD_WEBHOOK_URL="$3"
 
 # 1. Resolve arguments / env variables
 if [ -z "$DISCORD_WEBHOOK_URL" ] && [ -n "$DISCORD_WEBHOOK_URL_ENV" ]; then
     DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL_ENV"
+fi
+
+if [ -z "$DEV_DISCORD_WEBHOOK_URL" ] && [ -n "$DEV_DISCORD_WEBHOOK_URL_ENV" ]; then
+    DEV_DISCORD_WEBHOOK_URL="$DEV_DISCORD_WEBHOOK_URL_ENV"
 fi
 
 # Ensure Discord URL is set (for notifier function creation/configuration)
@@ -24,7 +29,7 @@ if [ -z "$DISCORD_WEBHOOK_URL" ]; then
     NOTIFIER_EXISTS=$(aws lambda get-function --function-name "$NOTIFIER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
     if [ -z "$SCRAPER_EXISTS" ] || [ -z "$NOTIFIER_EXISTS" ]; then
         echo "Error: DISCORD_WEBHOOK_URL is required for initial deployment."
-        echo "Usage: ./deploy.sh <YOUR_DISCORD_WEBHOOK_URL> [OPTIONAL_S3_BUCKET_NAME]"
+        echo "Usage: ./deploy.sh <YOUR_DISCORD_WEBHOOK_URL> [OPTIONAL_S3_BUCKET_NAME] [DEV_DISCORD_WEBHOOK_URL]"
         exit 1
     fi
 fi
@@ -154,6 +159,12 @@ rm -rf build_scraper
 echo "Scraper package created: scraper.zip"
 
 # Deploy function
+# Build environment variables for Scraper
+SCRAPER_ENV_VARS="S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv"
+if [ -n "$DEV_DISCORD_WEBHOOK_URL" ] && [ "$DEV_DISCORD_WEBHOOK_URL" != "None" ]; then
+    SCRAPER_ENV_VARS="${SCRAPER_ENV_VARS},DEV_DISCORD_WEBHOOK_URL=${DEV_DISCORD_WEBHOOK_URL}"
+fi
+
 SCRAPER_EXISTS=$(aws lambda get-function --function-name "$SCRAPER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
 if [ -z "$SCRAPER_EXISTS" ]; then
     echo "Creating Scraper Lambda function..."
@@ -165,7 +176,7 @@ if [ -z "$SCRAPER_EXISTS" ]; then
         --zip-file fileb://scraper.zip \
         --timeout 300 \
         --memory-size 256 \
-        --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
+        --environment "Variables={${SCRAPER_ENV_VARS}}"
     echo "Scraper Lambda created."
 else
     echo "Scraper Lambda already exists. Updating code..."
@@ -177,20 +188,30 @@ else
     aws lambda wait function-updated --function-name "$SCRAPER_FUNCTION_NAME"
     
     echo "Updating Scraper configuration..."
-    if [ -n "$DISCORD_WEBHOOK_URL" ]; then
-        aws lambda update-function-configuration \
-            --function-name "$SCRAPER_FUNCTION_NAME" \
-            --timeout 300 \
-            --memory-size 256 \
-            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
-    else
-        EXISTING_WEBHOOK=$(aws lambda get-function-configuration --function-name "$SCRAPER_FUNCTION_NAME" --query "Environment.Variables.DISCORD_WEBHOOK_URL" --output text 2>/dev/null || echo "")
-        aws lambda update-function-configuration \
-            --function-name "$SCRAPER_FUNCTION_NAME" \
-            --timeout 300 \
-            --memory-size 256 \
-            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${EXISTING_WEBHOOK}}"
+    # Resolve DEV_DISCORD_WEBHOOK_URL: prioritize passed value, then existing DEV_DISCORD_WEBHOOK_URL, then fallback to existing DISCORD_WEBHOOK_URL
+    CURRENT_DEV_WEBHOOK="$DEV_DISCORD_WEBHOOK_URL"
+    if [ -z "$CURRENT_DEV_WEBHOOK" ]; then
+        EXISTING_DEV_WEBHOOK=$(aws lambda get-function-configuration --function-name "$SCRAPER_FUNCTION_NAME" --query "Environment.Variables.DEV_DISCORD_WEBHOOK_URL" --output text 2>/dev/null || echo "")
+        if [ "$EXISTING_DEV_WEBHOOK" != "None" ] && [ -n "$EXISTING_DEV_WEBHOOK" ]; then
+            CURRENT_DEV_WEBHOOK="$EXISTING_DEV_WEBHOOK"
+        else
+            EXISTING_OLD_WEBHOOK=$(aws lambda get-function-configuration --function-name "$SCRAPER_FUNCTION_NAME" --query "Environment.Variables.DISCORD_WEBHOOK_URL" --output text 2>/dev/null || echo "")
+            if [ "$EXISTING_OLD_WEBHOOK" != "None" ] && [ -n "$EXISTING_OLD_WEBHOOK" ]; then
+                CURRENT_DEV_WEBHOOK="$EXISTING_OLD_WEBHOOK"
+            fi
+        fi
     fi
+
+    SCRAPER_ENV_VARS="S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv"
+    if [ -n "$CURRENT_DEV_WEBHOOK" ] && [ "$CURRENT_DEV_WEBHOOK" != "None" ]; then
+        SCRAPER_ENV_VARS="${SCRAPER_ENV_VARS},DEV_DISCORD_WEBHOOK_URL=${CURRENT_DEV_WEBHOOK}"
+    fi
+
+    aws lambda update-function-configuration \
+        --function-name "$SCRAPER_FUNCTION_NAME" \
+        --timeout 300 \
+        --memory-size 256 \
+        --environment "Variables={${SCRAPER_ENV_VARS}}"
     echo "Scraper Lambda configuration updated."
 fi
 rm -f scraper.zip
@@ -207,42 +228,52 @@ cd ..
 rm -rf build_notifier
 echo "Notifier package created: notifier.zip"
 
-NOTIFIER_EXISTS=$(aws lambda get-function --function-name "$NOTIFIER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
-if [ -z "$NOTIFIER_EXISTS" ]; then
-    echo "Creating Notifier Lambda function..."
-    aws lambda create-function \
-        --function-name "$NOTIFIER_FUNCTION_NAME" \
-        --runtime python3.11 \
-        --role "$ROLE_ARN" \
-        --handler lambda_function.lambda_handler \
-        --zip-file fileb://notifier.zip \
-        --timeout 30 \
-        --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
-    echo "Notifier Lambda created."
-else
-    echo "Notifier Lambda already exists. Updating code..."
-    aws lambda update-function-code \
-        --function-name "$NOTIFIER_FUNCTION_NAME" \
-        --zip-file fileb://notifier.zip
-        
-    echo "Waiting for Notifier Lambda code update to complete..."
-    aws lambda wait function-updated --function-name "$NOTIFIER_FUNCTION_NAME"
-    
-    echo "Updating Notifier configuration..."
-    if [ -n "$DISCORD_WEBHOOK_URL" ]; then
-        aws lambda update-function-configuration \
-            --function-name "$NOTIFIER_FUNCTION_NAME" \
-            --timeout 30 \
-            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}}"
-    else
-        EXISTING_WEBHOOK=$(aws lambda get-function-configuration --function-name "$NOTIFIER_FUNCTION_NAME" --query "Environment.Variables.DISCORD_WEBHOOK_URL" --output text 2>/dev/null || echo "")
-        aws lambda update-function-configuration \
-            --function-name "$NOTIFIER_FUNCTION_NAME" \
-            --timeout 30 \
-            --environment "Variables={S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv,DISCORD_WEBHOOK_URL=${EXISTING_WEBHOOK}}"
+    NOTIFIER_ENV_VARS="S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv"
+    if [ -n "$DISCORD_WEBHOOK_URL" ] && [ "$DISCORD_WEBHOOK_URL" != "None" ]; then
+        NOTIFIER_ENV_VARS="${NOTIFIER_ENV_VARS},DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}"
     fi
-    echo "Notifier Lambda configuration updated."
-fi
+
+    NOTIFIER_EXISTS=$(aws lambda get-function --function-name "$NOTIFIER_FUNCTION_NAME" --query "Configuration.FunctionArn" --output text 2>/dev/null || true)
+    if [ -z "$NOTIFIER_EXISTS" ]; then
+        echo "Creating Notifier Lambda function..."
+        aws lambda create-function \
+            --function-name "$NOTIFIER_FUNCTION_NAME" \
+            --runtime python3.11 \
+            --role "$ROLE_ARN" \
+            --handler lambda_function.lambda_handler \
+            --zip-file fileb://notifier.zip \
+            --timeout 30 \
+            --environment "Variables={${NOTIFIER_ENV_VARS}}"
+        echo "Notifier Lambda created."
+    else
+        echo "Notifier Lambda already exists. Updating code..."
+        aws lambda update-function-code \
+            --function-name "$NOTIFIER_FUNCTION_NAME" \
+            --zip-file fileb://notifier.zip
+            
+        echo "Waiting for Notifier Lambda code update to complete..."
+        aws lambda wait function-updated --function-name "$NOTIFIER_FUNCTION_NAME"
+        
+        echo "Updating Notifier configuration..."
+        CURRENT_NOTIFIER_WEBHOOK="$DISCORD_WEBHOOK_URL"
+        if [ -z "$CURRENT_NOTIFIER_WEBHOOK" ]; then
+            EXISTING_WEBHOOK=$(aws lambda get-function-configuration --function-name "$NOTIFIER_FUNCTION_NAME" --query "Environment.Variables.DISCORD_WEBHOOK_URL" --output text 2>/dev/null || echo "")
+            if [ "$EXISTING_WEBHOOK" != "None" ]; then
+                CURRENT_NOTIFIER_WEBHOOK="$EXISTING_WEBHOOK"
+            fi
+        fi
+
+        NOTIFIER_ENV_VARS="S3_BUCKET=${S3_BUCKET_NAME},S3_KEY=schedule_dates.csv"
+        if [ -n "$CURRENT_NOTIFIER_WEBHOOK" ] && [ "$CURRENT_NOTIFIER_WEBHOOK" != "None" ]; then
+            NOTIFIER_ENV_VARS="${NOTIFIER_ENV_VARS},DISCORD_WEBHOOK_URL=${CURRENT_NOTIFIER_WEBHOOK}"
+        fi
+
+        aws lambda update-function-configuration \
+            --function-name "$NOTIFIER_FUNCTION_NAME" \
+            --timeout 30 \
+            --environment "Variables={${NOTIFIER_ENV_VARS}}"
+        echo "Notifier Lambda configuration updated."
+    fi
 rm -f notifier.zip
 
 # 7. Configure EventBridge Triggers
